@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dbus python3-gi shellcheck
+      - name: Check Python syntax
+        run: /usr/bin/python3 -m compileall -q src scripts tests
+      - name: Run tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Check shell syntax
+        run: bash -n install.sh uninstall.sh verify.sh
+      - name: Run ShellCheck
+        run: shellcheck install.sh uninstall.sh verify.sh

@@ -1,0 +1,15 @@
+[Unit]
+Description=Waydroid Apple Music MPRIS bridge
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%E/waydroid-apple-music/bridge.env
+ExecStart=/usr/bin/python3 %h/.local/lib/waydroid-apple-music/waydroid_apple_mpris.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
