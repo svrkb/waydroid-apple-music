@@ -119,9 +119,16 @@ class WaydroidAppleMusic(dbus.service.Object):
 
     @staticmethod
     def _artwork_key(title, artist, album=""):
-        identity = "\0".join(
-            value.strip().casefold() for value in (title, artist, album)
-        )
+        # One cache entry per album; per-track only when the album is
+        # unknown.
+        if album:
+            identity = "\0".join(
+                ("album", album.strip().casefold(), artist.strip().casefold())
+            )
+        else:
+            identity = "\0".join(
+                ("track", title.strip().casefold(), artist.strip().casefold())
+            )
         return hashlib.sha1(identity.encode("utf-8")).hexdigest()
 
     def _cached_artwork(self, title, artist, album):
