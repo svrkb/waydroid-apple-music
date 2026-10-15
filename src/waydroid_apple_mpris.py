@@ -57,6 +57,10 @@ CACHE_HOME = Path(
 )
 ARTWORK_DIR = CACHE_HOME / "waydroid-apple-music" / "artwork"
 DEFAULT_ADB = shutil.which("adb") or "/usr/bin/adb"
+CATALOG_USER_AGENT = (
+    "WaydroidAppleMPRIS/1 "
+    "(https://github.com/willbeez/waydroid-apple-music)"
+)
 
 
 class MprisError(dbus.DBusException):
@@ -222,6 +226,141 @@ class WaydroidAppleMusic(dbus.service.Object):
                 )
         return candidates
 
+    @staticmethod
+    def _itunes_candidates(results):
+        return [
+            {
+                "title": result.get("trackName", ""),
+                "artist": result.get("artistName", ""),
+                "album": result.get("collectionName", ""),
+                "artist_id": result.get("artistId", ""),
+                "artwork_url": result.get("artworkUrl100", ""),
+            }
+            for result in results
+            if isinstance(result, dict)
+        ]
+
+    @staticmethod
+    def _artwork_variant(url):
+        if not url.startswith("https://"):
+            return ""
+        return re.sub(
+            r"/\d+x\d+[a-z]{0,2}(?=\.[A-Za-z0-9]+$)", "/600x600bb", url
+        )
+
+    @staticmethod
+    def _read_json(request):
+        with urlopen(request, timeout=8) as response:
+            payload = response.read(2_000_001)
+        if len(payload) > 2_000_000:
+            raise ValueError("catalog response too large")
+        response_data = json.loads(payload.decode("utf-8"))
+        if not isinstance(response_data, dict):
+            raise ValueError("catalog response is not an object")
+        return response_data
+
+    @staticmethod
+    def _read_image(url):
+        request = Request(url, headers={"User-Agent": CATALOG_USER_AGENT})
+        with urlopen(request, timeout=8) as response:
+            image = response.read(8_000_001)
+        if not image or len(image) > 8_000_000:
+            raise ValueError("artwork response invalid")
+        return image
+
+    def _itunes_album_art(self, artist_id, album):
+        params = urlencode({"id": artist_id, "entity": "album", "limit": 200})
+        lookup_request = Request(
+            f"https://itunes.apple.com/lookup?{params}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": CATALOG_USER_AGENT,
+            },
+        )
+        response_data = self._read_json(lookup_request)
+        wanted_album = self._normalize(album)
+        best_rating = 0.0
+        best_url = ""
+        for result in response_data.get("results", []):
+            if (
+                not isinstance(result, dict)
+                or result.get("wrapperType") != "collection"
+            ):
+                continue
+            rating = SequenceMatcher(
+                None,
+                wanted_album,
+                self._normalize(result.get("collectionName")),
+            ).ratio()
+            if rating > best_rating:
+                best_rating = rating
+                best_url = result.get("artworkUrl100", "")
+        if best_rating < 0.75:
+            return ""
+        return self._artwork_variant(best_url)
+
+    def _itunes_image(self, title, artist, album):
+        params = urlencode(
+            {
+                "term": f"{title} {artist}",
+                "media": "music",
+                "entity": "song",
+                "limit": 25,
+            }
+        )
+        search_request = Request(
+            f"https://itunes.apple.com/search?{params}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": CATALOG_USER_AGENT,
+            },
+        )
+        response_data = self._read_json(search_request)
+        candidates = self._itunes_candidates(response_data.get("results", []))
+        match = self._catalog_match(candidates, title, artist, album)
+        if not match:
+            return None
+        album_similarity = SequenceMatcher(
+            None,
+            self._normalize(album),
+            self._normalize(match.get("album", "")),
+        ).ratio()
+        artwork_url = ""
+        if album and album_similarity < 0.75 and match.get("artist_id"):
+            artwork_url = self._itunes_album_art(
+                match.get("artist_id", ""), album
+            )
+        if not artwork_url:
+            artwork_url = self._artwork_variant(match.get("artwork_url", ""))
+        if not artwork_url:
+            return None
+        return self._read_image(artwork_url)
+
+    def _musicbrainz_image(self, title, artist, album):
+        terms = [
+            f"recording:{self._musicbrainz_phrase(title)}",
+            f"artist:{self._musicbrainz_phrase(artist)}",
+        ]
+        params = urlencode({"query": " AND ".join(terms), "fmt": "json", "limit": 10})
+        search_request = Request(
+            f"https://musicbrainz.org/ws/2/recording/?{params}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": CATALOG_USER_AGENT,
+            },
+        )
+        response_data = self._read_json(search_request)
+        candidates = self._musicbrainz_candidates(
+            response_data.get("recordings", [])
+        )
+        match = self._catalog_match(candidates, title, artist, album)
+        release_id = match.get("release_id", "") if match else ""
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", release_id):
+            return None
+        return self._read_image(
+            f"https://coverartarchive.org/release/{release_id}/front-500"
+        )
+
     def _catalog_artwork(self, title, artist, album):
         if not CATALOG_ARTWORK or not title or not artist:
             return ""
@@ -233,49 +372,20 @@ class WaydroidAppleMusic(dbus.service.Object):
             return ""
         self.last_catalog_request = now
 
-        terms = [
-            f"recording:{self._musicbrainz_phrase(title)}",
-            f"artist:{self._musicbrainz_phrase(artist)}",
-        ]
-        params = urlencode({"query": " AND ".join(terms), "fmt": "json", "limit": 10})
-        user_agent = (
-            "WaydroidAppleMPRIS/1 "
-            "(https://github.com/willbeez/waydroid-apple-music)"
-        )
-        search_request = Request(
-            f"https://musicbrainz.org/ws/2/recording/?{params}",
-            headers={
-                "Accept": "application/json",
-                "User-Agent": user_agent,
-            },
-        )
+        image = None
+        for lookup in (self._itunes_image, self._musicbrainz_image):
+            try:
+                image = lookup(title, artist, album)
+            except (OSError, ValueError, json.JSONDecodeError):
+                image = None
+            if image:
+                break
+        if not image:
+            self.catalog_failures[key] = now
+            return ""
+
         temporary = None
         try:
-            with urlopen(search_request, timeout=8) as response:
-                payload = response.read(2_000_001)
-            if len(payload) > 2_000_000:
-                raise ValueError("catalog response too large")
-            response_data = json.loads(payload.decode("utf-8"))
-            if not isinstance(response_data, dict):
-                raise ValueError("catalog response is not an object")
-            candidates = self._musicbrainz_candidates(
-                response_data.get("recordings", [])
-            )
-            match = self._catalog_match(candidates, title, artist, album)
-            release_id = match.get("release_id", "") if match else ""
-            if not re.fullmatch(r"[0-9a-fA-F-]{36}", release_id):
-                raise ValueError("no matching artwork")
-            artwork_url = (
-                f"https://coverartarchive.org/release/{release_id}/front-500"
-            )
-            image_request = Request(
-                artwork_url, headers={"User-Agent": user_agent}
-            )
-            with urlopen(image_request, timeout=8) as response:
-                image = response.read(8_000_001)
-            if not image or len(image) > 8_000_000:
-                raise ValueError("artwork response invalid")
-
             if image.startswith(b"\xff\xd8\xff"):
                 suffix = ".jpg"
             elif image.startswith(b"\x89PNG\r\n\x1a\n"):
