@@ -45,6 +45,15 @@ def env_float(name, default, minimum):
     return max(minimum, value)
 
 
+def base_title(value):
+    base = (value or "").strip()
+    while True:
+        stripped = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*$", "", base).strip()
+        if not stripped or stripped == base:
+            return base
+        base = stripped
+
+
 CATALOG_ARTWORK = env_flag("WAYDROID_APPLE_MPRIS_CATALOG_ARTWORK", False)
 FORCE_VOLUME = env_flag("WAYDROID_APPLE_MPRIS_FORCE_VOLUME", False)
 AUDIO_WATCHDOG = env_flag("WAYDROID_APPLE_MPRIS_AUDIO_WATCHDOG", False)
@@ -163,6 +172,7 @@ class WaydroidAppleMusic(dbus.service.Object):
         wanted_title = self._normalize(title)
         wanted_artist = self._normalize(artist)
         wanted_album = self._normalize(album)
+        wanted_titles = {wanted_title, base_title(wanted_title)}
         exact = [
             result
             for result in results
@@ -185,7 +195,11 @@ class WaydroidAppleMusic(dbus.service.Object):
             result_title = self._normalize(result.get("title"))
             result_artist = self._normalize(result.get("artist"))
             result_album = self._normalize(result.get("album"))
-            title_score = SequenceMatcher(None, wanted_title, result_title).ratio()
+            title_score = max(
+                SequenceMatcher(None, wanted, candidate).ratio()
+                for wanted in wanted_titles
+                for candidate in {result_title, base_title(result_title)}
+            )
             artist_score = SequenceMatcher(None, wanted_artist, result_artist).ratio()
             album_score = SequenceMatcher(None, wanted_album, result_album).ratio()
             score = title_score * 3 + artist_score * 2 + album_score
@@ -299,10 +313,35 @@ class WaydroidAppleMusic(dbus.service.Object):
             return ""
         return self._artwork_variant(best_url)
 
+    def _itunes_artist_id(self, artist):
+        params = urlencode(
+            {
+                "term": artist,
+                "media": "music",
+                "entity": "musicArtist",
+                "limit": 5,
+            }
+        )
+        search_request = Request(
+            f"https://itunes.apple.com/search?{params}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": CATALOG_USER_AGENT,
+            },
+        )
+        response_data = self._read_json(search_request)
+        wanted_artist = self._normalize(artist)
+        for result in response_data.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            if self._normalize(result.get("artistName")) == wanted_artist:
+                return result.get("artistId", "")
+        return ""
+
     def _itunes_image(self, title, artist, album):
         params = urlencode(
             {
-                "term": f"{title} {artist}",
+                "term": f"{base_title(title)} {artist}",
                 "media": "music",
                 "entity": "song",
                 "limit": 25,
@@ -318,20 +357,25 @@ class WaydroidAppleMusic(dbus.service.Object):
         response_data = self._read_json(search_request)
         candidates = self._itunes_candidates(response_data.get("results", []))
         match = self._catalog_match(candidates, title, artist, album)
-        if not match:
-            return None
-        album_similarity = SequenceMatcher(
-            None,
-            self._normalize(album),
-            self._normalize(match.get("album", "")),
-        ).ratio()
         artwork_url = ""
-        if album and album_similarity < 0.75 and match.get("artist_id"):
-            artwork_url = self._itunes_album_art(
-                match.get("artist_id", ""), album
-            )
-        if not artwork_url:
-            artwork_url = self._artwork_variant(match.get("artwork_url", ""))
+        if match:
+            album_similarity = SequenceMatcher(
+                None,
+                self._normalize(album),
+                self._normalize(match.get("album", "")),
+            ).ratio()
+            if album and album_similarity < 0.75 and match.get("artist_id"):
+                artwork_url = self._itunes_album_art(
+                    match.get("artist_id", ""), album
+                )
+            if not artwork_url:
+                artwork_url = self._artwork_variant(
+                    match.get("artwork_url", "")
+                )
+        if not artwork_url and album:
+            artist_id = self._itunes_artist_id(artist)
+            if artist_id:
+                artwork_url = self._itunes_album_art(artist_id, album)
         if not artwork_url:
             return None
         return self._read_image(artwork_url)
