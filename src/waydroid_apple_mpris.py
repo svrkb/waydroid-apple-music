@@ -110,6 +110,7 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.pipewire_monitor_ready = False
         self.pipewire_lock = threading.Lock()
         self.poll_running = False
+        self.artwork_fetch_key = None
         if AUDIO_WATCHDOG:
             threading.Thread(
                 target=self._pipewire_monitor_worker, daemon=True
@@ -460,6 +461,44 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.artwork_cache[key] = uri
         return uri
 
+    def _start_artwork_fetch(self, title, artist, album):
+        key = self._artwork_key(title, artist, album)
+        now = time.monotonic()
+        if self.artwork_fetch_key == key:
+            return
+        if now - self.catalog_failures.get(key, 0.0) < 600:
+            return
+        self.artwork_fetch_key = key
+        threading.Thread(
+            target=self._artwork_worker,
+            args=(key, title, artist, album),
+            daemon=True,
+        ).start()
+
+    def _artwork_worker(self, key, title, artist, album):
+        uri = ""
+        try:
+            uri = self._cached_artwork(title, artist, album)
+            if not uri:
+                uri = self._catalog_artwork(title, artist, album)
+        except Exception as error:
+            print(f"Could not fetch artwork: {error}", flush=True)
+        finally:
+            if self.artwork_fetch_key == key:
+                self.artwork_fetch_key = None
+        if uri:
+            GLib.idle_add(self._apply_artwork, key, uri)
+
+    def _apply_artwork(self, key, uri):
+        if self._artwork_key(self.title, self.artist, self.album) != key:
+            return False
+        if self.art_url != uri:
+            self.art_url = uri
+            self.PropertiesChanged(
+                PLAYER_IFACE, {"Metadata": self._metadata()}, []
+            )
+        return False
+
     def _run(self, args, timeout=5):
         try:
             result = subprocess.run(
@@ -763,8 +802,6 @@ class WaydroidAppleMusic(dbus.service.Object):
         art_url = ""
         if CATALOG_ARTWORK:
             art_url = self._cached_artwork(title, artist, album)
-            if not art_url:
-                art_url = self._catalog_artwork(title, artist, album)
         self._check_audio_watchdog(active, status)
         return {
             "active": active,
@@ -789,7 +826,12 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.title = state["title"]
         self.artist = state["artist"]
         self.album = state["album"]
-        self.art_url = state["art_url"]
+        art_url = state["art_url"]
+        if not art_url and CATALOG_ARTWORK:
+            art_url = self._cached_artwork(
+                state["title"], state["artist"], state["album"]
+            )
+        self.art_url = art_url
         new_player = self._player_properties()
         changed = {}
         for key in (
@@ -809,7 +851,10 @@ class WaydroidAppleMusic(dbus.service.Object):
 
     def _apply_state_safely(self, state):
         try:
-            return self._apply_state(state)
+            result = self._apply_state(state)
+            if CATALOG_ARTWORK and not self.art_url and self.title and self.artist:
+                self._start_artwork_fetch(self.title, self.artist, self.album)
+            return result
         except Exception as error:
             print(f"Could not publish Apple Music state: {error}", flush=True)
             return False
@@ -838,8 +883,14 @@ class WaydroidAppleMusic(dbus.service.Object):
     def _dispatch(self, command):
         def worker():
             self._adb_shell("cmd", "media_session", "dispatch", command, timeout=3)
+            GLib.timeout_add(150, self._poll_soon)
+            GLib.timeout_add(700, self._poll_soon)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_soon(self):
+        self.poll()
+        return False
 
     def _launch(self):
         def worker():
