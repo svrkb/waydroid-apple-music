@@ -71,7 +71,7 @@ if ((ALL)); then
     FOLLOW_OUTPUT=1
     AUDIO_WATCHDOG=1
 else
-    ask "Look up album artwork with MusicBrainz and Cover Art Archive?" no && ARTWORK=1
+    ask "Look up album artwork with iTunes, falling back to Deezer?" no && ARTWORK=1
     ask "Apply the tested release-keys workaround for Apple's rooted-device warning?" no && ROOT_WORKAROUND=1
     ask "Install the experimental 32-bit/192 kHz Waydroid audio path?" no && HIRES=1
     ask "Disable Waydroid's safe-volume cap and keep Android music at 15/15?" no && FORCE_VOLUME=1

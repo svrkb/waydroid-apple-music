@@ -16,9 +16,9 @@ License 2.0 notice. Relevant upstream licensing remains with those projects.
 
 Metadata and cover lookup uses these public services:
 
-- MusicBrainz: https://musicbrainz.org/doc/MusicBrainz_API
-- Cover Art Archive: https://musicbrainz.org/doc/Cover_Art_Archive
+- Deezer: https://developers.deezer.com/api
 
-MusicBrainz provides its free web service for non-commercial use. Commercial
-users should disable catalog artwork or arrange suitable service with
-MetaBrainz. See https://musicbrainz.org/doc/MusicBrainz_API/FAQ.
+Deezer's search API is public and free to call without an API key, though it
+is rate limited and offers no service level agreement. It is used only as a
+fallback when the iTunes Search API has no match. Commercial users should
+review Deezer's terms before enabling catalog artwork.

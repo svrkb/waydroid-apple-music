@@ -5,7 +5,7 @@ This makes the Android Apple Music app feel more at home on a Linux desktop.
 It can add:
 
 - song information and controls in GNOME's media menu
-- album artwork from MusicBrainz and the Cover Art Archive
+- album artwork from the iTunes Search API, falling back to Deezer
 - a shared 32-bit/192 kHz path from Waydroid into PipeWire
 - automatic following of Linux's current output device
 - protection against Bluetooth dropping into phone-call mode
@@ -84,10 +84,10 @@ it through Linux's normal MPRIS interface. Play, pause, previous, and next work
 from GNOME's media menu.
 
 Waydroid does not expose Apple Music's cover bitmap in a useful form. For cover
-art, the bridge sends the song title, artist, and album to
-[MusicBrainz](https://musicbrainz.org/) and downloads a matching front cover
-from the [Cover Art Archive](https://musicbrainz.org/doc/Cover_Art_Archive).
-It stores the matching image in:
+art, the bridge sends the song title, artist, and album to the
+[iTunes Search API](https://performance-partners.apple.com/search-api) and, if
+that has no match, to [Deezer](https://developers.deezer.com/api). It stores
+the matching image in:
 
 ```text
 ~/.cache/waydroid-apple-music/artwork
@@ -98,14 +98,14 @@ connection does have broad access to your Waydroid container, and the bridge
 uses Android's unredacted notification dump to read the song title and artist.
 Do not approve the ADB prompt on a host account you do not trust.
 
-Artwork is off unless you choose it during installation. MusicBrainz's free
-API is for non-commercial use. Commercial users should leave artwork off or
-arrange service with MetaBrainz.
+Artwork is off unless you choose it during installation. Both APIs are public,
+but neither offers a service level agreement, and Deezer rate limits callers.
+Commercial users should review both services' terms before enabling artwork.
 
 The artwork directory is private to your Linux account. The bridge caches
 covers there permanently and never deletes them, so clear that directory
-yourself if you want the space back. Cover art can still be copyrighted; the
-Cover Art Archive says to use images at your own risk.
+yourself if you want the space back. Cover art can still be copyrighted; use
+these images at your own risk.
 
 You can turn artwork off in:
 

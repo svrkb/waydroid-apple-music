@@ -220,38 +220,6 @@ class WaydroidAppleMusic(dbus.service.Object):
         return best_result
 
     @staticmethod
-    def _musicbrainz_phrase(value):
-        escaped = (value or "").replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-
-    @staticmethod
-    def _musicbrainz_candidates(recordings):
-        candidates = []
-        for recording in recordings:
-            credits = recording.get("artist-credit", [])
-            artist = "".join(
-                (
-                    credit.get("name")
-                    or credit.get("artist", {}).get("name", "")
-                )
-                + credit.get("joinphrase", "")
-                for credit in credits
-                if isinstance(credit, dict)
-            ).strip()
-            for release in recording.get("releases", []):
-                if not isinstance(release, dict) or not release.get("id"):
-                    continue
-                candidates.append(
-                    {
-                        "title": recording.get("title", ""),
-                        "artist": artist,
-                        "album": release.get("title", ""),
-                        "release_id": release["id"],
-                    }
-                )
-        return candidates
-
-    @staticmethod
     def _itunes_candidates(results):
         return [
             {
@@ -391,30 +359,64 @@ class WaydroidAppleMusic(dbus.service.Object):
             return None
         return self._read_image(artwork_url)
 
-    def _musicbrainz_image(self, title, artist, album):
-        terms = [
-            f"recording:{self._musicbrainz_phrase(title)}",
-            f"artist:{self._musicbrainz_phrase(artist)}",
-        ]
-        params = urlencode({"query": " AND ".join(terms), "fmt": "json", "limit": 10})
+    @staticmethod
+    def _deezer_candidates(results):
+        candidates = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            album = result.get("album")
+            artist = result.get("artist")
+            candidates.append(
+                {
+                    "title": result.get("title", ""),
+                    "artist": artist.get("name", "")
+                    if isinstance(artist, dict)
+                    else "",
+                    "album": album.get("title", "")
+                    if isinstance(album, dict)
+                    else "",
+                    "artwork_url": album.get("cover_xl", "")
+                    if isinstance(album, dict)
+                    else "",
+                }
+            )
+        return candidates
+
+    @staticmethod
+    def _deezer_artwork_variant(url):
+        """Return a fixed-size variant of a Deezer cover URL.
+
+        Deezer's CDN URLs end in a size segment such as /1000x1000- followed
+        by the colour and quality fields, so the size can be rewritten in
+        place without disturbing the rest of the path.
+        """
+        if not url.startswith("https://"):
+            return ""
+        return re.sub(r"/\d+x\d+(?=-)", "/600x600", url)
+
+    def _deezer_image(self, title, artist, album):
+        # Deezer's field-qualified syntax (artist:"...") matches nothing, so
+        # the query is plain terms and the scoring below does the filtering.
+        params = urlencode(
+            {"q": f"{base_title(title)} {artist} {album}".strip(), "limit": 25}
+        )
         search_request = Request(
-            f"https://musicbrainz.org/ws/2/recording/?{params}",
+            f"https://api.deezer.com/search?{params}",
             headers={
                 "Accept": "application/json",
                 "User-Agent": CATALOG_USER_AGENT,
             },
         )
         response_data = self._read_json(search_request)
-        candidates = self._musicbrainz_candidates(
-            response_data.get("recordings", [])
-        )
+        candidates = self._deezer_candidates(response_data.get("data", []))
         match = self._catalog_match(candidates, title, artist, album)
-        release_id = match.get("release_id", "") if match else ""
-        if not re.fullmatch(r"[0-9a-fA-F-]{36}", release_id):
+        if not match:
             return None
-        return self._read_image(
-            f"https://coverartarchive.org/release/{release_id}/front-500"
-        )
+        artwork_url = self._deezer_artwork_variant(match.get("artwork_url", ""))
+        if not artwork_url:
+            return None
+        return self._read_image(artwork_url)
 
     def _catalog_artwork(self, title, artist, album):
         if not CATALOG_ARTWORK or not title or not artist:
@@ -428,7 +430,7 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.last_catalog_request = now
 
         image = None
-        for lookup in (self._itunes_image, self._musicbrainz_image):
+        for lookup in (self._itunes_image, self._deezer_image):
             try:
                 image = lookup(title, artist, album)
             except (OSError, ValueError, json.JSONDecodeError):

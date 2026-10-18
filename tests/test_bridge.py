@@ -1,6 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 from unittest import mock
 import unittest
 
@@ -89,25 +90,85 @@ NotificationRecord(pkg=com.apple.android.music category=transport)
         match = bridge._catalog_match(results, "Song", "Artist", "Album")
         self.assertEqual(match["album"], "Album (Deluxe Edition)")
 
-    def test_musicbrainz_candidates(self):
-        recordings = [
+    def test_deezer_candidates(self):
+        tracks = [
             {
                 "title": "Song",
-                "artist-credit": [{"name": "Artist"}],
-                "releases": [{"id": "123", "title": "Album"}],
-            }
+                "artist": {"name": "Artist"},
+                "album": {
+                    "title": "Album",
+                    "cover_xl": "https://cdn-images.dzcdn.net/images"
+                    "/cover/abc/1000x1000-000000-80-0-0.jpg",
+                },
+            },
+            "not a track",
+            {"title": "Song 2"},
         ]
         self.assertEqual(
-            MODULE.WaydroidAppleMusic._musicbrainz_candidates(recordings),
+            MODULE.WaydroidAppleMusic._deezer_candidates(tracks),
             [
                 {
                     "title": "Song",
                     "artist": "Artist",
                     "album": "Album",
-                    "release_id": "123",
-                }
+                    "artwork_url": "https://cdn-images.dzcdn.net/images"
+                    "/cover/abc/1000x1000-000000-80-0-0.jpg",
+                },
+                {"title": "Song 2", "artist": "", "album": "", "artwork_url": ""},
             ],
         )
+
+    def test_deezer_artwork_variant_rewrites_size(self):
+        rewrite = MODULE.WaydroidAppleMusic._deezer_artwork_variant
+        self.assertEqual(
+            rewrite("https://cdn-images.dzcdn.net/images/cover/abc"
+                    "/1000x1000-000000-80-0-0.jpg"),
+            "https://cdn-images.dzcdn.net/images/cover/abc"
+            "/600x600-000000-80-0-0.jpg",
+        )
+        # Only the size segment is touched, never the colour or quality.
+        self.assertEqual(
+            rewrite("https://cdn-images.dzcdn.net/images/cover/abc"
+                    "/56x56-ff00aa-100-0-0.jpg"),
+            "https://cdn-images.dzcdn.net/images/cover/abc"
+            "/600x600-ff00aa-100-0-0.jpg",
+        )
+        self.assertEqual(rewrite("http://example.com/1000x1000.jpg"), "")
+        self.assertEqual(rewrite(""), "")
+
+    def test_deezer_search_uses_plain_terms(self):
+        # Deezer's field-qualified syntax (artist:"...") returns nothing, so
+        # the query must be plain terms with the album appended.
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge._read_json = mock.Mock(return_value={"data": []})
+        captured = {}
+
+        def fake_read_json(request):
+            captured["url"] = request.full_url
+            return {"data": []}
+
+        bridge._read_json = fake_read_json
+
+        self.assertIsNone(bridge._deezer_image("Song", "Artist", "Album"))
+        self.assertIn("api.deezer.com/search", captured["url"])
+        self.assertNotIn("artist%3A", captured["url"])
+        self.assertIn("q=Song+Artist+Album", captured["url"])
+
+    def test_deezer_fallback_used_when_itunes_misses(self):
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge.catalog_failures = {}
+        bridge.last_catalog_request = 0.0
+        bridge.artwork_cache = {}
+        bridge._itunes_image = mock.Mock(return_value=None)
+        bridge._deezer_image = mock.Mock(return_value=b"\xff\xd8\xff fake jpeg")
+
+        with mock.patch.object(MODULE, "CATALOG_ARTWORK", True), \
+                mock.patch.object(MODULE, "ARTWORK_DIR", Path(tempfile.mkdtemp())):
+            uri = bridge._catalog_artwork("Song", "Artist", "Album")
+
+        self.assertTrue(uri.startswith("file://"))
+        bridge._itunes_image.assert_called_once()
+        bridge._deezer_image.assert_called_once()
 
     def test_poll_error_can_retry(self):
         bridge = object.__new__(MODULE.WaydroidAppleMusic)
