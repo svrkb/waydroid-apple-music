@@ -83,6 +83,23 @@ The bridge reads Apple Music's Android media session once per second and exposes
 it through Linux's normal MPRIS interface. Play, pause, previous, and next work
 from GNOME's media menu.
 
+A control press does not wait for the next poll. The bridge publishes the status
+it expects straight away and lets the following read confirm or correct it, so
+GNOME's icon flips as you press. It also translates GNOME's play-or-pause toggle
+into an explicit play or pause whenever the current status is known, because
+Apple Music's own toggle handler is slower. On the tested machine this dropped
+press to audio actually changing from around 360-390 ms to 37-78 ms, and press
+to GNOME's icon from 424-782 ms to about a millisecond.
+
+When Waydroid is not running, the bridge stops probing for it. It first checks
+whether Waydroid's network interface exists and skips the attempt entirely when
+it does not, because no probe can succeed without it. Consecutive failures also
+back the retry off, doubling from five seconds up to a one-minute cap, and the
+first success resets that. The trade-off is that if the Waydroid session dies
+while the bridge stays up, passive refresh of the song title can lag by up to a
+minute. A play or pause press ignores the backoff and reconnects immediately, so
+the controls always respond right away.
+
 Waydroid does not expose Apple Music's cover bitmap in a useful form. For cover
 art, the bridge sends the song title, artist, and album to the
 [iTunes Search API](https://performance-partners.apple.com/search-api) and, if
@@ -97,6 +114,16 @@ It does not send your Apple ID, password, cookies, or tokens. The local ADB
 connection does have broad access to your Waydroid container, and the bridge
 uses Android's unredacted notification dump to read the song title and artist.
 Do not approve the ADB prompt on a host account you do not trust.
+
+The lookup runs in the background, so the song title and artist reach your
+desktop immediately and the cover follows a moment later. It matches a track
+against the catalog by title and artist, and falls back to the album's own cover
+when the track itself has no match. Titles with bracketed suffixes such as
+`(feat. Someone)` or `(Deluxe Edition)` are matched by their base title, and
+tracks that appear only on an album still find that album's cover.
+
+Covers are cached one per album rather than one per track, so a repeat listen of
+the same album reuses the same file instead of fetching and storing it again.
 
 Artwork is off unless you choose it during installation. Both APIs are public,
 but neither offers a service level agreement, and Deezer rate limits callers.
@@ -189,6 +216,32 @@ It does not uninstall Waydroid, Apple Music, or shared Ubuntu packages such as
 setting stay at their last values because the installer could not know what
 they were before ADB was approved. Lower the volume in Android or with Linux's
 normal volume control if needed.
+
+## Changes from upstream
+
+This is a fork of
+[willbeez/waydroid-apple-music](https://github.com/willbeez/waydroid-apple-music).
+The audio patch, installer flow, and uninstaller are the same. The media bridge
+differs in these ways:
+
+- **Artwork sources.** iTunes Search API first, then Deezer, where upstream uses
+  MusicBrainz and the Cover Art Archive.
+- **Better matching.** Bracketed title suffixes such as `(feat. Someone)` are
+  stripped before matching, and album-only tracks fall back to the album cover.
+- **Artwork no longer blocks.** Track and artist publish immediately and the
+  cover follows from a background fetch, where upstream waited for the lookup
+  before publishing any metadata.
+- **One cover per album.** The cache is keyed on album and artist rather than
+  per track, so a repeat listen reuses the same file.
+- **Faster controls.** A press publishes its expected status at once and turns
+  the toggle into an explicit play or pause, cutting press-to-audio latency from
+  roughly 360-390 ms to 37-78 ms.
+- **No cache eviction.** Covers are kept until you clear the directory, where
+  upstream trimmed at 200 files or 100 MB.
+- **No ADB churn.** Probing stops while Waydroid is unreachable and backs off,
+  instead of forking three adb processes on every poll forever.
+- **Tests.** The bridge test suite grew from a handful of cases to cover
+  artwork matching, control latency, connection backoff, and volume enforcement.
 
 ## Tested on
 
