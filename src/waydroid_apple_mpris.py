@@ -67,6 +67,12 @@ ADB_CONNECTION_TTL = 15.0
 # When Waydroid is unreachable, poll at most this often instead of on every
 # poll cycle. Control presses always force a fresh connection attempt.
 ADB_RETRY_BACKOFF = 5.0
+# Repeated failures escalate the backoff up to this, so a session that is
+# really gone stops costing three adb forks every few seconds forever.
+ADB_RETRY_BACKOFF_MAX = 60.0
+# Waydroid's bridge interface. It carries the container subnet, so if it is
+# absent no adb probe can succeed; reading /sys costs no forks at all.
+WAYDROID_INTERFACE = "waydroid0"
 # How long a control press's expected status is trusted before a differing
 # read is allowed to override it. Android reacts to a dispatch in well under
 # this, so a read that predates the reaction cannot flicker the desktop.
@@ -131,6 +137,7 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.preview_deadline = 0.0
         self.connection_verified = None
         self.connection_retry_after = 0.0
+        self.connection_backoff = ADB_RETRY_BACKOFF
         self.artwork_fetch_key = None
         if AUDIO_WATCHDOG:
             threading.Thread(
@@ -526,18 +533,37 @@ class WaydroidAppleMusic(dbus.service.Object):
                 return fields[2]
         return rows[-1][2] if rows and len(rows[-1]) >= 3 else None
 
+    @staticmethod
+    def _waydroid_interface_up():
+        """True if Waydroid's bridge interface exists.
+
+        The interface carries the container's subnet, so when it is absent
+        the container has no network and adb cannot reach it. Reading /sys
+        costs no forks, unlike asking adb or waydroid itself.
+        """
+        return os.path.isdir(f"/sys/class/net/{WAYDROID_INTERFACE}")
+
     def _ensure_connection(self, force=False):
         """Return (connected, reused).
 
         A connection verified within ADB_CONNECTION_TTL is trusted without
         probing adb again, which keeps a control press down to one adb call.
-        A failed probe is not retried for ADB_RETRY_BACKOFF seconds unless the
-        caller passes force=True, as control presses do.
+        A failed probe is not retried until connection_backoff has elapsed
+        unless the caller passes force=True, as control presses do, and each
+        consecutive failure doubles that delay up to ADB_RETRY_BACKOFF_MAX.
         """
         ip = self._waydroid_ip()
         if not ip or not os.path.isfile(self.adb):
             self.serial = None
             self.connection_verified = None
+            return False, False
+        if not self._waydroid_interface_up():
+            # Waydroid's bridge is gone, so the container has no network and
+            # no adb probe can succeed. Skip the probe entirely instead of
+            # forking three adb processes every poll.
+            self.serial = None
+            self.connection_verified = None
+            self.connection_retry_after = time.monotonic() + ADB_RETRY_BACKOFF_MAX
             return False, False
         serial = f"{ip}:5555"
         if serial != self.serial:
@@ -554,12 +580,20 @@ class WaydroidAppleMusic(dbus.service.Object):
         state = self._run([self.adb, "-s", serial, "get-state"], timeout=2)
         if state and state.stdout.strip() == "device":
             self.connection_verified = now
+            self.connection_backoff = ADB_RETRY_BACKOFF
             return True, False
         self._run([self.adb, "connect", serial], timeout=5)
         state = self._run([self.adb, "-s", serial, "get-state"], timeout=2)
         connected = bool(state and state.stdout.strip() == "device")
         self.connection_verified = now if connected else None
-        self.connection_retry_after = 0.0 if connected else now + ADB_RETRY_BACKOFF
+        if connected:
+            self.connection_backoff = ADB_RETRY_BACKOFF
+            self.connection_retry_after = 0.0
+        else:
+            self.connection_retry_after = now + self.connection_backoff
+            self.connection_backoff = min(
+                self.connection_backoff * 2, ADB_RETRY_BACKOFF_MAX
+            )
         return connected, False
 
     def _adb_shell(self, *args, timeout=5, force_connect=False):
@@ -711,6 +745,10 @@ class WaydroidAppleMusic(dbus.service.Object):
         now = time.monotonic()
         if now - self.last_volume_check < 20:
             return
+        # Record the attempt, not the success. If adb is down the reads below
+        # return None, and without this the next poll would retry them both
+        # immediately instead of waiting out the interval.
+        self.last_volume_check = now
         safe_state = self._adb_shell(
             "settings", "get", "global", "audio_safe_volume_state", timeout=3
         )
@@ -719,7 +757,6 @@ class WaydroidAppleMusic(dbus.service.Object):
         )
         if safe_state is None or volume is None:
             return
-        self.last_volume_check = now
         if safe_state.strip() != "2":
             self._adb_shell(
                 "settings", "put", "global", "audio_safe_volume_state", "2", timeout=3

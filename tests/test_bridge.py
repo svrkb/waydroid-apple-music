@@ -242,7 +242,9 @@ NotificationRecord(pkg=com.apple.android.music category=transport)
         bridge.serial = None
         bridge.connection_verified = None
         bridge.connection_retry_after = 0.0
+        bridge.connection_backoff = MODULE.ADB_RETRY_BACKOFF
         bridge._waydroid_ip = mock.Mock(return_value="192.168.240.112")
+        bridge._waydroid_interface_up = mock.Mock(return_value=True)
         bridge._run = mock.Mock(return_value=mock.Mock(stdout="device\n"))
 
         with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
@@ -252,13 +254,33 @@ NotificationRecord(pkg=com.apple.android.music category=transport)
             self.assertEqual(bridge._ensure_connection(), (True, True))
             self.assertEqual(bridge._run.call_count, 1)
 
+    def test_missing_interface_skips_adb_probe(self):
+        # A gone bridge means the container has no network, so probing adb
+        # would only fork processes that cannot succeed.
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge.adb = "/usr/bin/adb"
+        bridge.serial = None
+        bridge.connection_verified = None
+        bridge.connection_retry_after = 0.0
+        bridge.connection_backoff = MODULE.ADB_RETRY_BACKOFF
+        bridge._waydroid_ip = mock.Mock(return_value="192.168.240.112")
+        bridge._waydroid_interface_up = mock.Mock(return_value=False)
+        bridge._run = mock.Mock()
+
+        with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
+            self.assertEqual(bridge._ensure_connection(), (False, False))
+            self.assertEqual(bridge._ensure_connection(force=True), (False, False))
+            bridge._run.assert_not_called()
+
     def test_failed_connection_probe_backs_off(self):
         bridge = object.__new__(MODULE.WaydroidAppleMusic)
         bridge.adb = "/usr/bin/adb"
         bridge.serial = None
         bridge.connection_verified = None
         bridge.connection_retry_after = 0.0
+        bridge.connection_backoff = MODULE.ADB_RETRY_BACKOFF
         bridge._waydroid_ip = mock.Mock(return_value="192.168.240.112")
+        bridge._waydroid_interface_up = mock.Mock(return_value=True)
         bridge._run = mock.Mock(return_value=None)
 
         with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
@@ -271,6 +293,84 @@ NotificationRecord(pkg=com.apple.android.music category=transport)
             # ...but a control press forces a fresh attempt.
             self.assertEqual(bridge._ensure_connection(force=True), (False, False))
             self.assertEqual(bridge._run.call_count, 3)
+
+    def test_connection_backoff_escalates_and_recovers(self):
+        # Each consecutive failure doubles the wait, capped, and a single
+        # success returns it to the base delay so recovery stays prompt.
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge.adb = "/usr/bin/adb"
+        bridge.serial = None
+        bridge.connection_verified = None
+        bridge.connection_retry_after = 0.0
+        bridge.connection_backoff = MODULE.ADB_RETRY_BACKOFF
+        bridge._waydroid_ip = mock.Mock(return_value="192.168.240.112")
+        bridge._waydroid_interface_up = mock.Mock(return_value=True)
+        bridge._run = mock.Mock(return_value=None)
+
+        delays = []
+        with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
+            for _ in range(4):
+                before = MODULE.time.monotonic()
+                bridge._ensure_connection(force=True)
+                delays.append(round(bridge.connection_retry_after - before))
+                # Expire the window so the next forced call probes again.
+                bridge.connection_retry_after = 0.0
+
+        self.assertEqual(
+            delays,
+            [
+                MODULE.ADB_RETRY_BACKOFF,
+                MODULE.ADB_RETRY_BACKOFF * 2,
+                MODULE.ADB_RETRY_BACKOFF * 4,
+                MODULE.ADB_RETRY_BACKOFF * 8,
+            ],
+        )
+        self.assertLessEqual(bridge.connection_backoff, MODULE.ADB_RETRY_BACKOFF_MAX)
+
+        # A working connection resets the backoff to the base delay.
+        bridge._run = mock.Mock(return_value=mock.Mock(stdout="device\n"))
+        bridge.connection_retry_after = 0.0
+        bridge.connection_verified = None
+        with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
+            self.assertEqual(bridge._ensure_connection(force=True), (True, False))
+        self.assertEqual(bridge.connection_backoff, MODULE.ADB_RETRY_BACKOFF)
+
+    def test_backoff_is_capped(self):
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge.adb = "/usr/bin/adb"
+        bridge.serial = None
+        bridge.connection_verified = None
+        bridge.connection_retry_after = 0.0
+        bridge.connection_backoff = MODULE.ADB_RETRY_BACKOFF
+        bridge._waydroid_ip = mock.Mock(return_value="192.168.240.112")
+        bridge._waydroid_interface_up = mock.Mock(return_value=True)
+        bridge._run = mock.Mock(return_value=None)
+
+        with mock.patch.object(MODULE.os.path, "isfile", return_value=True):
+            for _ in range(10):
+                bridge._ensure_connection(force=True)
+                bridge.connection_retry_after = 0.0
+
+        self.assertEqual(bridge.connection_backoff, MODULE.ADB_RETRY_BACKOFF_MAX)
+        self.assertLessEqual(
+            bridge.connection_retry_after - MODULE.time.monotonic(),
+            MODULE.ADB_RETRY_BACKOFF_MAX,
+        )
+
+    def test_volume_check_records_failure_too(self):
+        # A dead adb must not make every poll retry both settings reads.
+        bridge = object.__new__(MODULE.WaydroidAppleMusic)
+        bridge.last_volume_check = 0.0
+        bridge._adb_shell = mock.Mock(return_value=None)
+        start = MODULE.time.monotonic()
+
+        with mock.patch.object(MODULE, "FORCE_VOLUME", True):
+            bridge._enforce_media_volume()
+            self.assertEqual(bridge._adb_shell.call_count, 2)
+            self.assertGreater(bridge.last_volume_check, start)
+            # Inside the interval the reads are skipped entirely.
+            bridge._enforce_media_volume()
+            self.assertEqual(bridge._adb_shell.call_count, 2)
 
     def test_dispatch_ignores_stale_snapshot(self):
         bridge = object.__new__(MODULE.WaydroidAppleMusic)
