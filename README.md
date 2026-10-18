@@ -102,9 +102,10 @@ Artwork is off unless you choose it during installation. MusicBrainz's free
 API is for non-commercial use. Commercial users should leave artwork off or
 arrange service with MetaBrainz.
 
-The artwork directory is private to your Linux account. The bridge keeps at
-most 200 covers and 100 MB. Cover art can still be copyrighted; the Cover Art
-Archive says to use images at your own risk.
+The artwork directory is private to your Linux account. The bridge caches
+covers there permanently and never deletes them, so clear that directory
+yourself if you want the space back. Cover art can still be copyrighted; the
+Cover Art Archive says to use images at your own risk.
 
 You can turn artwork off in:
 

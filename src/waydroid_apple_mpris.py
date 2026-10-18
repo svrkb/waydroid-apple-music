@@ -168,31 +168,6 @@ class WaydroidAppleMusic(dbus.service.Object):
         return ""
 
     @staticmethod
-    def _trim_artwork_cache(max_files=200, max_bytes=100 * 1024 * 1024):
-        try:
-            files = sorted(
-                (
-                    path
-                    for path in ARTWORK_DIR.iterdir()
-                    if path.is_file() and path.suffix in {".jpg", ".png"}
-                ),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            return
-        used = 0
-        for index, path in enumerate(files):
-            try:
-                size = path.stat().st_size
-                if index >= max_files or used + size > max_bytes:
-                    path.unlink()
-                else:
-                    used += size
-            except OSError:
-                pass
-
-    @staticmethod
     def _normalize(value):
         normalized = unicodedata.normalize("NFKC", value or "").casefold()
         return " ".join(normalized.split())
@@ -476,7 +451,6 @@ class WaydroidAppleMusic(dbus.service.Object):
                 artwork_file.write(image)
             os.replace(temporary, path)
             path.chmod(0o600)
-            self._trim_artwork_cache()
         except (OSError, ValueError, json.JSONDecodeError):
             self.catalog_failures[key] = now
             if temporary is not None:
