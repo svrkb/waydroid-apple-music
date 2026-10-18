@@ -61,6 +61,16 @@ WATCHDOG_GRACE_SECONDS = env_float(
     "WAYDROID_APPLE_MPRIS_WATCHDOG_GRACE", 1.0, 0.05
 )
 WATCHDOG_COOLDOWN_SECONDS = 600
+# An ADB connection verified within this window is trusted without probing
+# again, so a control press costs a single adb call.
+ADB_CONNECTION_TTL = 15.0
+# When Waydroid is unreachable, poll at most this often instead of on every
+# poll cycle. Control presses always force a fresh connection attempt.
+ADB_RETRY_BACKOFF = 5.0
+# How long a control press's expected status is trusted before a differing
+# read is allowed to override it. Android reacts to a dispatch in well under
+# this, so a read that predates the reaction cannot flicker the desktop.
+PREVIEW_GRACE_SECONDS = 0.6
 CACHE_HOME = Path(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
 )
@@ -110,12 +120,23 @@ class WaydroidAppleMusic(dbus.service.Object):
         self.pipewire_monitor_ready = False
         self.pipewire_lock = threading.Lock()
         self.poll_running = False
+        # Set when a re-read was requested while one was already in flight.
+        self.pending_poll = False
+        # Bumped on every control press; a poll snapshot older than this is
+        # discarded so it cannot flash a stale status at the desktop.
+        self.state_seq = 0
+        # Status a control press is expected to produce, trusted until Android
+        # has had time to confirm it.
+        self.preview_status_value = ""
+        self.preview_deadline = 0.0
+        self.connection_verified = None
+        self.connection_retry_after = 0.0
         self.artwork_fetch_key = None
         if AUDIO_WATCHDOG:
             threading.Thread(
                 target=self._pipewire_monitor_worker, daemon=True
             ).start()
-        GLib.timeout_add(1000, self.poll)
+        GLib.timeout_add(1000, self._periodic_poll)
 
     @staticmethod
     def _artwork_key(title, artist, album=""):
@@ -531,25 +552,55 @@ class WaydroidAppleMusic(dbus.service.Object):
                 return fields[2]
         return rows[-1][2] if rows and len(rows[-1]) >= 3 else None
 
-    def _ensure_connection(self):
+    def _ensure_connection(self, force=False):
+        """Return (connected, reused).
+
+        A connection verified within ADB_CONNECTION_TTL is trusted without
+        probing adb again, which keeps a control press down to one adb call.
+        A failed probe is not retried for ADB_RETRY_BACKOFF seconds unless the
+        caller passes force=True, as control presses do.
+        """
         ip = self._waydroid_ip()
         if not ip or not os.path.isfile(self.adb):
             self.serial = None
-            return False
+            self.connection_verified = None
+            return False, False
         serial = f"{ip}:5555"
-        if self.serial != serial:
+        if serial != self.serial:
             self.serial = serial
+            self.connection_verified = None
+        now = time.monotonic()
+        if (
+            self.connection_verified is not None
+            and now - self.connection_verified < ADB_CONNECTION_TTL
+        ):
+            return True, True
+        if not force and now < self.connection_retry_after:
+            return False, False
         state = self._run([self.adb, "-s", serial, "get-state"], timeout=2)
         if state and state.stdout.strip() == "device":
-            return True
+            self.connection_verified = now
+            return True, False
         self._run([self.adb, "connect", serial], timeout=5)
         state = self._run([self.adb, "-s", serial, "get-state"], timeout=2)
-        return bool(state and state.stdout.strip() == "device")
+        connected = bool(state and state.stdout.strip() == "device")
+        self.connection_verified = now if connected else None
+        self.connection_retry_after = 0.0 if connected else now + ADB_RETRY_BACKOFF
+        return connected, False
 
-    def _adb_shell(self, *args, timeout=5):
-        if not self._ensure_connection():
+    def _adb_shell(self, *args, timeout=5, force_connect=False):
+        connected, reused = self._ensure_connection(force=force_connect)
+        if not connected:
             return None
         result = self._run([self.adb, "-s", self.serial, "shell", *args], timeout)
+        if result is None and reused:
+            # The cached connection dropped since it was verified; reconnect
+            # once and try again.
+            self.connection_verified = None
+            if self._ensure_connection(force=True)[0]:
+                result = self._run(
+                    [self.adb, "-s", self.serial, "shell", *args], timeout
+                )
         return result.stdout if result else None
 
     def _handle_pipewire_event(self, block):
@@ -839,25 +890,83 @@ class WaydroidAppleMusic(dbus.service.Object):
                 state["title"], state["artist"], state["album"]
             )
         self.art_url = art_url
+        self._publish_player_changes(old_player)
+        return False
+
+    PLAYER_CHANGE_KEYS = (
+        "PlaybackStatus",
+        "Metadata",
+        "CanGoNext",
+        "CanGoPrevious",
+        "CanPlay",
+        "CanPause",
+        "CanControl",
+    )
+
+    def _publish_player_changes(self, old_player):
         new_player = self._player_properties()
         changed = {}
-        for key in (
-            "PlaybackStatus",
-            "Metadata",
-            "CanGoNext",
-            "CanGoPrevious",
-            "CanPlay",
-            "CanPause",
-            "CanControl",
-        ):
+        for key in self.PLAYER_CHANGE_KEYS:
             if old_player[key] != new_player[key]:
                 changed[key] = new_player[key]
         if changed:
             self.PropertiesChanged(PLAYER_IFACE, changed, [])
-        return False
+        return changed
 
-    def _apply_state_safely(self, state):
+    PREVIEW_STATUS = {"play": "Playing", "pause": "Paused", "stop": "Stopped"}
+
+    # Apple Music handles an explicit play or pause command in well under
+    # 100 ms, but its play-pause toggle takes over 300 ms. Since the current
+    # status is always known here, the toggle is translated to the explicit
+    # command it actually means.
+    STATUS_ADB_COMMAND = {"Playing": "play", "Paused": "pause", "Stopped": "stop"}
+
+    def _target_status(self, command):
+        """The playback status a control command is meant to produce."""
+        if command == "play-pause":
+            return "Paused" if self.playback_status == "Playing" else "Playing"
+        return self.PREVIEW_STATUS.get(command)
+
+    def _preview_status(self, target):
+        """Publish the status a control press is expected to produce.
+
+        The desktop reacts to the click immediately instead of waiting for the
+        next poll; the next read then confirms or corrects it.
+        """
+        if not self.session_active or target is None:
+            return
+        if target == self.playback_status:
+            return
+        old_player = self._player_properties()
+        # Freeze the position when pausing, keep it running when playing.
+        self.position_us = self._position()
+        self.position_time = time.monotonic()
+        self.playback_status = target
+        if target == "Stopped":
+            self.position_us = 0
+        self.preview_status_value = target
+        self.preview_deadline = time.monotonic() + PREVIEW_GRACE_SECONDS
+        self._publish_player_changes(old_player)
+
+    def _apply_state_safely(self, state, state_seq=None):
         try:
+            if state_seq is not None and state_seq != self.state_seq:
+                # A control press landed while this snapshot was being read, so
+                # it may predate the press. Drop it and read again rather than
+                # flash a stale status at the desktop.
+                self.pending_poll = True
+                return False
+            if (
+                self.preview_status_value
+                and time.monotonic() < self.preview_deadline
+                and state["status"] != self.preview_status_value
+            ):
+                # The read still sees the pre-press state, so Android has not
+                # caught up with the dispatch yet. Read again instead of
+                # reverting what the press already published.
+                self.pending_poll = True
+                return False
+            self.preview_status_value = ""
             result = self._apply_state(state)
             if CATALOG_ARTWORK and not self.art_url and self.title and self.artist:
                 self._start_artwork_fetch(self.title, self.artist, self.album)
@@ -866,37 +975,75 @@ class WaydroidAppleMusic(dbus.service.Object):
             print(f"Could not publish Apple Music state: {error}", flush=True)
             return False
         finally:
-            self.poll_running = False
+            self._finish_poll()
 
-    def _poll_failed(self, error):
+    def _poll_failed(self, error, state_seq=None):
         print(f"Could not read Apple Music state: {error}", flush=True)
-        self.poll_running = False
+        self._finish_poll()
         return False
 
-    def _poll_worker(self):
+    def _finish_poll(self):
+        self.poll_running = False
+        if self.pending_poll:
+            self.poll()
+
+    def _poll_worker(self, state_seq=None):
         try:
             state = self._read_state()
         except Exception as error:
-            GLib.idle_add(self._poll_failed, str(error))
+            GLib.idle_add(self._poll_failed, str(error), state_seq)
             return
-        GLib.idle_add(self._apply_state_safely, state)
+        GLib.idle_add(self._apply_state_safely, state, state_seq)
 
-    def poll(self):
-        if not self.poll_running:
-            self.poll_running = True
-            threading.Thread(target=self._poll_worker, daemon=True).start()
+    def _periodic_poll(self):
+        self.poll()
         return True
 
+    def poll(self, queued=False):
+        if self.poll_running:
+            # A read is already in flight. Remember that another one is wanted
+            # instead of dropping the request, so a requested re-read always
+            # happens right after the current one finishes.
+            if queued:
+                self.pending_poll = True
+            return
+        self.pending_poll = False
+        self.poll_running = True
+        state_seq = self.state_seq
+        threading.Thread(
+            target=self._poll_worker, args=(state_seq,), daemon=True
+        ).start()
+
     def _dispatch(self, command):
+        # A control press should feel immediate: bump the state sequence so
+        # in-flight snapshots are discarded, then publish the expected status
+        # before the adb command even runs. The target status is resolved
+        # first, because publishing it changes playback_status.
+        self.state_seq += 1
+        target = self._target_status(command) if self.session_active else None
+        self._preview_status(target)
+        # Prefer the explicit command over Apple Music's slow toggle, but only
+        # when the current status is actually known.
+        adb_command = command
+        if command == "play-pause" and target is not None:
+            adb_command = self.STATUS_ADB_COMMAND.get(target, command)
+
         def worker():
-            self._adb_shell("cmd", "media_session", "dispatch", command, timeout=3)
+            self._adb_shell(
+                "cmd",
+                "media_session",
+                "dispatch",
+                adb_command,
+                timeout=3,
+                force_connect=True,
+            )
             GLib.timeout_add(150, self._poll_soon)
             GLib.timeout_add(700, self._poll_soon)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _poll_soon(self):
-        self.poll()
+        self.poll(queued=True)
         return False
 
     def _launch(self):

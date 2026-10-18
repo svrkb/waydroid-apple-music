@@ -328,7 +328,10 @@ if ((FOLLOW_OUTPUT)); then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now waydroid-apple-mpris.service
+systemctl --user enable waydroid-apple-mpris.service
+# Restart so a re-run picks up new bridge code or bridge.env settings; a
+# plain enable --now would leave the old process running.
+systemctl --user restart waydroid-apple-mpris.service
 
 printf '\nInstalled. Start Apple Music in Waydroid and accept the one-time ADB prompt.\n'
 printf 'Run ./verify.sh to check the setup. Run ./uninstall.sh to undo it.\n'
